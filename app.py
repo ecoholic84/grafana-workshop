@@ -4,8 +4,15 @@ import mysql.connector
 from mysql.connector import Error
 import os
 import time
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Gauge
 
 app = Flask(__name__)
+
+# Prometheus metrics
+REQUEST_COUNT = Counter('flask_request_count', 'Total number of HTTP requests', ['method', 'endpoint', 'status'])
+REQUEST_LATENCY = Histogram('flask_request_latency_seconds', 'Request latency in seconds', ['method', 'endpoint'])
+TODO_COUNT = Gauge('todo_items_total', 'Total number of todo items in database')
 
 # Database configuration from environment variables
 DB_CONFIG = {
@@ -34,7 +41,6 @@ def get_db_connection(with_database=True, retries=5, delay=2):
 
 def init_db():
     """Initialize the database and todos table if they don't exist."""
-    # Connect to server without database
     connection = get_db_connection(with_database=False)
     if not connection:
         print("Failed to connect to MariaDB server")
@@ -42,14 +48,11 @@ def init_db():
     
     try:
         cursor = connection.cursor()
-        # Create database
         cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']}")
         connection.commit()
         
-        # Switch to database
         cursor.execute(f"USE {DB_CONFIG['database']}")
         
-        # Create table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS todos (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -66,6 +69,19 @@ def init_db():
     finally:
         cursor.close()
         connection.close()
+
+def update_todo_count():
+    """Update the total todo items count metric"""
+    connection = get_db_connection()
+    if connection:
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM todos")
+            count = cursor.fetchone()[0]
+            TODO_COUNT.set(count)
+        finally:
+            cursor.close()
+            connection.close()
 
 def ensure_db_initialized():
     """Ensure database is initialized before handling requests."""
@@ -93,11 +109,18 @@ def ensure_db_initialized():
 @app.route('/todos', methods=['GET'])
 def list_todos():
     """Retrieve all todo items."""
+    start_time = time.time()
     if not ensure_db_initialized():
+        REQUEST_COUNT.labels('GET', '/todos', '500').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('GET', '/todos').observe(latency)
         return jsonify({'error': 'Database initialization failed'}), 500
     
     connection = get_db_connection()
     if not connection:
+        REQUEST_COUNT.labels('GET', '/todos', '500').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('GET', '/todos').observe(latency)
         return jsonify({'error': 'Database connection failed'}), 500
     
     try:
@@ -106,8 +129,15 @@ def list_todos():
         todos = cursor.fetchall()
         for todo in todos:
             todo['created_at'] = todo['created_at'].isoformat()
+        update_todo_count()
+        REQUEST_COUNT.labels('GET', '/todos', '200').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('GET', '/todos').observe(latency)
         return jsonify(todos), 200
     except Error as e:
+        REQUEST_COUNT.labels('GET', '/todos', '500').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('GET', '/todos').observe(latency)
         return jsonify({'error': str(e)}), 500
     finally:
         cursor.close()
@@ -116,15 +146,25 @@ def list_todos():
 @app.route('/todos', methods=['POST'])
 def add_todo():
     """Add a new todo item."""
+    start_time = time.time()
     if not ensure_db_initialized():
+        REQUEST_COUNT.labels('POST', '/todos', '500').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('POST', '/todos').observe(latency)
         return jsonify({'error': 'Database initialization failed'}), 500
     
     data = request.get_json()
     if not data or 'title' not in data or not data['title']:
+        REQUEST_COUNT.labels('POST', '/todos', '400').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('POST', '/todos').observe(latency)
         return jsonify({'error': 'Title is required'}), 400
     
     connection = get_db_connection()
     if not connection:
+        REQUEST_COUNT.labels('POST', '/todos', '500').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('POST', '/todos').observe(latency)
         return jsonify({'error': 'Database connection failed'}), 500
     
     try:
@@ -141,15 +181,26 @@ def add_todo():
             'title': new_todo[1],
             'created_at': new_todo[2].isoformat()
         }
+        update_todo_count()
+        REQUEST_COUNT.labels('POST', '/todos', '201').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('POST', '/todos').observe(latency)
         return jsonify(todo_dict), 201
     except Error as e:
+        REQUEST_COUNT.labels('POST', '/todos', '500').inc()
+        latency = time.time() - start_time
+        REQUEST_LATENCY.labels('POST', '/todos').observe(latency)
         return jsonify({'error': str(e)}), 500
     finally:
         cursor.close()
         connection.close()
 
+@app.route('/metrics')
+def metrics():
+    """Expose Prometheus metrics."""
+    return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+
 if __name__ == '__main__':
-    # Initial database setup
     if not init_db():
         print("Initial database setup failed, will retry on first request")
     app.run(debug=True, host='0.0.0.0', port=5000)
